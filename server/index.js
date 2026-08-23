@@ -8,6 +8,7 @@ import db from './db.js'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import fs from 'fs'
+import crypto from 'crypto'
 import { encrypt, decrypt, generateRandomKey } from './crypto.js'
 // let LZString import removed - obsolete
 
@@ -30,6 +31,7 @@ const PROXY_CONCURRENCY_LIMIT = parseInt(process.env.PROXY_CONCURRENCY_LIMIT || 
 const MAX_QUEUE_SIZE = 500
 const DOMAIN_THROTTLE_MS = 200
 const STREMIO_API = 'https://api.strem.io/api'
+const MANUAL_FAILOVER_API_TOKEN = (process.env.MANUAL_FAILOVER_API_TOKEN || '').trim()
 
 // --- Proxy Concurrency & Throttling Management ---
 const proxyQueue = []
@@ -282,8 +284,19 @@ const schema = `
     metadata TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS manual_failover_groups (
+    owner_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    active_mode TEXT NOT NULL DEFAULT 'primary',
+    state_updated_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (owner_id, id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_history_account_ts ON failover_history (account_id, timestamp DESC);
   CREATE INDEX IF NOT EXISTS idx_rules_account ON autopilot_rules (account_id);
+  CREATE INDEX IF NOT EXISTS idx_manual_failover_id ON manual_failover_groups (id);
 `
 
 // Execute schema creation
@@ -1439,6 +1452,185 @@ const syncStremioLive = async (authKey, chain, activeUrl, accountId, storedAddon
     }
 }
 
+// --- Manual Failover External API ---
+const manualFailoverLocks = new Set()
+
+const secureTokenMatches = (provided, expected) => {
+    if (!provided || !expected) return false
+    const providedBuffer = Buffer.from(String(provided))
+    const expectedBuffer = Buffer.from(String(expected))
+    return providedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(providedBuffer, expectedBuffer)
+}
+
+const requireManualFailoverToken = async (request, reply) => {
+    if (MANUAL_FAILOVER_API_TOKEN.length < 32) {
+        reply.status(503)
+        return reply.send({ error: 'Manual failover API is not configured' })
+    }
+
+    const authorization = request.headers.authorization || ''
+    const providedToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : ''
+    if (!secureTokenMatches(providedToken, MANUAL_FAILOVER_API_TOKEN)) {
+        fastify.log.warn({ category: 'Security' }, `[Manual Failover API] Rejected request from ${request.ip}`)
+        reply.status(401)
+        return reply.send({ error: 'Unauthorized' })
+    }
+}
+
+const authenticateManualFailoverSync = async (request, reply) => {
+    const ownerId = String(request.headers['x-sync-id'] || '').trim()
+    const syncPassword = String(request.headers['x-sync-password'] || '').trim()
+    if (!ownerId || !syncPassword) {
+        reply.status(401)
+        reply.send({ error: 'Missing sync authentication headers' })
+        return null
+    }
+
+    const row = await db.get('SELECT password FROM kv_store WHERE key = $1', [ownerId])
+    const storedPassword = row?.password ? decrypt(row.password, FALLBACK_KEYS) : null
+    if (!row || !secureTokenMatches(syncPassword, storedPassword)) {
+        reply.status(401)
+        reply.send({ error: 'Unauthorized' })
+        return null
+    }
+    return ownerId
+}
+
+const parseManualFailoverPayload = (row) => {
+    const decryptedPayload = decrypt(row.payload, FALLBACK_KEYS)
+    if (!decryptedPayload) throw new Error('Could not decrypt manual failover group')
+    return JSON.parse(decryptedPayload)
+}
+
+const getManualFailoverExecutionStates = async (ownerId) => {
+    const rows = await db.query(
+        'SELECT id, active_mode, state_updated_at FROM manual_failover_groups WHERE owner_id = $1 ORDER BY id',
+        [ownerId]
+    )
+    return rows.map(row => ({
+        id: row.id,
+        activeMode: row.active_mode === 'backup' ? 'backup' : 'primary',
+        updatedAt: Number(row.state_updated_at) || 0,
+    }))
+}
+
+const pauseConflictingAutopilotRules = async (accountId, addonUrls) => {
+    const normalizedTargets = new Set(addonUrls.map(url => normalizeAddonUrl(url).toLowerCase()))
+    const rules = await db.query(
+        'SELECT id, priority_chain FROM autopilot_rules WHERE account_id = $1 AND is_active = 1',
+        [accountId]
+    )
+    let paused = 0
+
+    for (const rule of rules) {
+        try {
+            const decryptedChain = decrypt(rule.priority_chain, FALLBACK_KEYS)
+            const chain = Array.isArray(decryptedChain)
+                ? decryptedChain
+                : JSON.parse(decryptedChain || '[]')
+            const conflicts = chain.some(url => normalizedTargets.has(normalizeAddonUrl(url).toLowerCase()))
+            if (conflicts) {
+                await db.run(
+                    'UPDATE autopilot_rules SET is_active = 0, is_automatic = 0, updated_at = $1 WHERE id = $2',
+                    [Date.now(), rule.id]
+                )
+                paused++
+            }
+        } catch (error) {
+            fastify.log.warn({ category: 'Autopilot' }, `[Manual Failover] Could not inspect rule ${rule.id}: ${error.message}`)
+        }
+    }
+    return paused
+}
+
+const executeManualFailoverGroup = async (row, target) => {
+    const lockKey = `${row.owner_id}:${row.id}`
+    if (manualFailoverLocks.has(lockKey)) {
+        const error = new Error('This failover group is already being updated')
+        error.statusCode = 409
+        throw error
+    }
+
+    manualFailoverLocks.add(lockKey)
+    try {
+        const payload = parseManualFailoverPayload(row)
+        const currentMode = row.active_mode === 'backup' ? 'backup' : 'primary'
+        if (currentMode === target) {
+            return {
+                success: true,
+                changed: false,
+                group: { id: row.id, name: payload.name, activeMode: currentMode },
+                succeeded: 0,
+                failed: 0,
+                failures: [],
+                pausedAutopilotRules: 0,
+            }
+        }
+
+        const accounts = Array.isArray(payload.accounts) ? payload.accounts : []
+        if (accounts.length === 0) {
+            const error = new Error('This group has no executable accounts. Open AIOManager to sync it first.')
+            error.statusCode = 409
+            throw error
+        }
+
+        const chain = [payload.primaryUrl, payload.backupUrl]
+        const activeUrl = target === 'backup' ? payload.backupUrl : payload.primaryUrl
+        const normalizedChain = chain.map(url => normalizeAddonUrl(url).toLowerCase())
+        const results = await Promise.allSettled(accounts.map(async account => {
+            if (!account?.id || !account?.authKey || !Array.isArray(account.addons)) {
+                throw new Error('Account execution data is incomplete')
+            }
+            const installedUrls = new Set(account.addons.map(addon =>
+                normalizeAddonUrl(addon?.transportUrl || '').toLowerCase()
+            ))
+            if (!normalizedChain.every(url => installedUrls.has(url))) {
+                throw new Error('Both primary and backup addons must be installed on the account')
+            }
+
+            await syncStremioLive(account.authKey, chain, activeUrl, account.id, account.addons)
+            const pausedRules = await pauseConflictingAutopilotRules(account.id, chain)
+            return { accountId: account.id, accountName: account.name || 'Stremio account', pausedRules }
+        }))
+
+        const successfulResults = results
+            .filter(result => result.status === 'fulfilled')
+            .map(result => result.value)
+        const failures = results.flatMap((result, index) => result.status === 'rejected' ? [{
+            accountId: accounts[index]?.id || 'unknown',
+            accountName: accounts[index]?.name || 'Stremio account',
+            reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        }] : [])
+        const now = Date.now()
+
+        if (successfulResults.length > 0) {
+            await db.run(
+                'UPDATE manual_failover_groups SET active_mode = $1, state_updated_at = $2, updated_at = $3 WHERE owner_id = $4 AND id = $5',
+                [target, now, now, row.owner_id, row.id]
+            )
+        }
+
+        const response = {
+            success: successfulResults.length > 0,
+            changed: successfulResults.length > 0,
+            group: { id: row.id, name: payload.name, activeMode: successfulResults.length > 0 ? target : currentMode },
+            succeeded: successfulResults.length,
+            failed: failures.length,
+            failures,
+            pausedAutopilotRules: successfulResults.reduce((sum, result) => sum + result.pausedRules, 0),
+            updatedAt: successfulResults.length > 0 ? now : Number(row.state_updated_at) || 0,
+        }
+
+        fastify.log.info(
+            { category: 'ManualFailover' },
+            `[${maskContext(row.id)}] ${target} requested: ${response.succeeded} succeeded, ${response.failed} failed.`
+        )
+        return response
+    } finally {
+        manualFailoverLocks.delete(lockKey)
+    }
+}
+
 // Autopilot configuration
 // Switching is now immediate based on health checks.
 
@@ -2022,6 +2214,187 @@ const start = async () => {
             return { success: true }
         })
 
+        // Browser-authenticated sync of the encrypted execution copy.
+        fastify.post('/api/manual-failover/sync', async (request, reply) => {
+            const ownerId = await authenticateManualFailoverSync(request, reply)
+            if (!ownerId) return
+
+            const incomingGroups = request.body?.groups
+            if (!Array.isArray(incomingGroups) || incomingGroups.length > 50) {
+                reply.status(400)
+                return { error: 'groups must be an array containing no more than 50 items' }
+            }
+
+            const syncedIds = []
+            for (const incoming of incomingGroups) {
+                const id = typeof incoming?.id === 'string' ? incoming.id.trim() : ''
+                const primaryUrl = typeof incoming?.primaryUrl === 'string' ? incoming.primaryUrl.trim() : ''
+                const backupUrl = typeof incoming?.backupUrl === 'string' ? incoming.backupUrl.trim() : ''
+                const accounts = Array.isArray(incoming?.accounts) ? incoming.accounts : []
+
+                if (!id || id.length > 200 || !primaryUrl || !backupUrl ||
+                    normalizeAddonUrl(primaryUrl).toLowerCase() === normalizeAddonUrl(backupUrl).toLowerCase()) {
+                    reply.status(400)
+                    return { error: 'Invalid manual failover group configuration' }
+                }
+                if (accounts.length > 500) {
+                    reply.status(400)
+                    return { error: `Group ${id} contains too many accounts` }
+                }
+
+                const cleanAccounts = []
+                for (const account of accounts) {
+                    if (!account?.id || !account?.authKey || !Array.isArray(account.addons) || account.addons.length > 500) {
+                        reply.status(400)
+                        return { error: `Group ${id} contains invalid account execution data` }
+                    }
+                    cleanAccounts.push({
+                        id: String(account.id).slice(0, 200),
+                        name: String(account.name || 'Stremio account').slice(0, 200),
+                        authKey: String(account.authKey),
+                        addons: account.addons,
+                    })
+                }
+
+                const existing = await db.get(
+                    'SELECT active_mode, state_updated_at FROM manual_failover_groups WHERE owner_id = $1 AND id = $2',
+                    [ownerId, id]
+                )
+                const incomingMode = incoming.activeMode === 'backup' ? 'backup' : 'primary'
+                const incomingModeTimestamp = Date.parse(incoming.modeUpdatedAt || incoming.updatedAt || '') || 0
+                const existingModeTimestamp = Number(existing?.state_updated_at) || 0
+                const shouldAcceptIncomingMode = !existing || incomingModeTimestamp > existingModeTimestamp
+                const activeMode = shouldAcceptIncomingMode ? incomingMode : existing.active_mode
+                const stateUpdatedAt = shouldAcceptIncomingMode
+                    ? (incomingModeTimestamp || Date.now())
+                    : existingModeTimestamp
+                const now = Date.now()
+                const payload = {
+                    id,
+                    name: String(incoming.name || 'Manual failover group').slice(0, 200),
+                    tag: String(incoming.tag || '').slice(0, 100),
+                    primaryUrl,
+                    backupUrl,
+                    primaryName: String(incoming.primaryName || '').slice(0, 200),
+                    backupName: String(incoming.backupName || '').slice(0, 200),
+                    accounts: cleanAccounts,
+                }
+                const encryptedPayload = encrypt(JSON.stringify(payload), PRIMARY_KEY)
+
+                await db.run(`
+                    INSERT INTO manual_failover_groups (owner_id, id, payload, active_mode, state_updated_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT(owner_id, id) DO UPDATE SET
+                        payload = excluded.payload,
+                        active_mode = excluded.active_mode,
+                        state_updated_at = excluded.state_updated_at,
+                        updated_at = excluded.updated_at
+                `, [ownerId, id, encryptedPayload, activeMode, stateUpdatedAt, now])
+                syncedIds.push(id)
+            }
+
+            if (syncedIds.length === 0) {
+                await db.run('DELETE FROM manual_failover_groups WHERE owner_id = $1', [ownerId])
+            } else {
+                const placeholders = syncedIds.map((_, index) => `$${index + 2}`).join(', ')
+                await db.run(
+                    `DELETE FROM manual_failover_groups WHERE owner_id = $1 AND id NOT IN (${placeholders})`,
+                    [ownerId, ...syncedIds]
+                )
+            }
+
+            return {
+                success: true,
+                synced: syncedIds.length,
+                states: await getManualFailoverExecutionStates(ownerId),
+            }
+        })
+
+        // Lightweight state pull used by an open dashboard after an external action.
+        fastify.get('/api/manual-failover/execution-state', async (request, reply) => {
+            const ownerId = await authenticateManualFailoverSync(request, reply)
+            if (!ownerId) return
+            return { states: await getManualFailoverExecutionStates(ownerId) }
+        })
+
+        // Token-authenticated external API for Apple Shortcuts, bots, and automations.
+        fastify.get('/api/manual-failover/groups', { preHandler: requireManualFailoverToken }, async () => {
+            const rows = await db.query(
+                'SELECT owner_id, id, payload, active_mode, state_updated_at FROM manual_failover_groups ORDER BY id'
+            )
+            const groups = []
+            for (const row of rows) {
+                try {
+                    const payload = parseManualFailoverPayload(row)
+                    groups.push({
+                        id: row.id,
+                        name: payload.name,
+                        tag: payload.tag,
+                        activeMode: row.active_mode === 'backup' ? 'backup' : 'primary',
+                        accountCount: Array.isArray(payload.accounts) ? payload.accounts.length : 0,
+                        updatedAt: Number(row.state_updated_at) || 0,
+                    })
+                } catch (error) {
+                    fastify.log.warn({ category: 'ManualFailover' }, `Skipping unreadable group ${row.id}: ${error.message}`)
+                }
+            }
+            groups.sort((a, b) => String(a.name).localeCompare(String(b.name)))
+            return { groups }
+        })
+
+        fastify.get('/api/manual-failover/:id/status', { preHandler: requireManualFailoverToken }, async (request, reply) => {
+            const row = await db.get(
+                'SELECT owner_id, id, payload, active_mode, state_updated_at FROM manual_failover_groups WHERE id = $1',
+                [request.params.id]
+            )
+            if (!row) {
+                reply.status(404)
+                return { error: 'Manual failover group not found' }
+            }
+            const payload = parseManualFailoverPayload(row)
+            return {
+                group: {
+                    id: row.id,
+                    name: payload.name,
+                    tag: payload.tag,
+                    activeMode: row.active_mode === 'backup' ? 'backup' : 'primary',
+                    accountCount: Array.isArray(payload.accounts) ? payload.accounts.length : 0,
+                    updatedAt: Number(row.state_updated_at) || 0,
+                }
+            }
+        })
+
+        fastify.post('/api/manual-failover/:id/:action', { preHandler: requireManualFailoverToken }, async (request, reply) => {
+            const action = String(request.params.action || '').toLowerCase()
+            if (!['toggle', 'failover', 'failback'].includes(action)) {
+                reply.status(400)
+                return { error: 'Action must be toggle, failover, or failback' }
+            }
+
+            const row = await db.get(
+                'SELECT owner_id, id, payload, active_mode, state_updated_at FROM manual_failover_groups WHERE id = $1',
+                [request.params.id]
+            )
+            if (!row) {
+                reply.status(404)
+                return { error: 'Manual failover group not found. Open AIOManager to sync it first.' }
+            }
+
+            const currentMode = row.active_mode === 'backup' ? 'backup' : 'primary'
+            const target = action === 'toggle'
+                ? (currentMode === 'primary' ? 'backup' : 'primary')
+                : (action === 'failover' ? 'backup' : 'primary')
+
+            try {
+                const result = await executeManualFailoverGroup(row, target)
+                if (!result.success) reply.status(502)
+                return result
+            } catch (error) {
+                reply.status(error.statusCode || 500)
+                return { error: error.message || 'Manual failover failed' }
+            }
+        })
+
         fastify.delete('/api/autopilot/:id', async (request, reply) => {
             const { id } = request.params
             await db.run('DELETE FROM autopilot_rules WHERE id = $1', [id])
@@ -2074,6 +2447,11 @@ const start = async () => {
             fastify.log.info({ category: 'Database' }, `Path: ${dbPath}`)
         }
         fastify.log.info({ category: 'Security' }, 'Zero-Knowledge mode active. 🛡️')
+        if (MANUAL_FAILOVER_API_TOKEN.length >= 32) {
+            fastify.log.info({ category: 'Security' }, 'Manual Failover API enabled with bearer-token authentication.')
+        } else {
+            fastify.log.warn({ category: 'Security' }, 'Manual Failover API disabled: MANUAL_FAILOVER_API_TOKEN must be at least 32 characters.')
+        }
 
         // --- Start Autopilot Worker ---
         startAutopilotWorker()
