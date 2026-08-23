@@ -6,7 +6,7 @@ This stack is intentionally independent of the existing AIOManager deployment.
 
 - Container: `aiomanager-manual-failover`
 - Host port: `127.0.0.1:1611`
-- Image: `ghcr.io/peden88/aiomanager:manual-failover`
+- Image: locally built as `aiomanager:manual-failover-test`
 - Database: `./aio-data-manual-failover/manual-failover-test.db`
 - Suggested hostname: `aiomanager-test.peden88.stream`
 
@@ -15,15 +15,19 @@ Do not mount the existing AIOManager data directory or reuse its encryption key.
 ## Prepare the VPS directory
 
 ```bash
-mkdir -p /opt/aiomanager-manual-failover/aio-data-manual-failover
+git clone --branch feature/manual-failover-groups \
+  https://github.com/peden88/AIOManager.git \
+  /opt/aiomanager-manual-failover
 cd /opt/aiomanager-manual-failover
+mkdir -p aio-data-manual-failover
 chown -R 65532:65532 aio-data-manual-failover
 ```
 
-Copy these files into that directory:
+Create the isolated environment file:
 
-- `docker-compose.manual-failover.yml`
-- `.env.manual-failover.example` as `.env.manual-failover`
+```bash
+cp .env.manual-failover.example .env.manual-failover
+```
 
 Generate the test encryption key:
 
@@ -36,10 +40,17 @@ Replace `REPLACE_WITH_A_NEW_64_CHARACTER_HEX_KEY` in `.env.manual-failover` with
 ## Start the independent stack
 
 ```bash
-docker compose -f docker-compose.manual-failover.yml pull
-docker compose -f docker-compose.manual-failover.yml up -d
+docker compose -f docker-compose.manual-failover.yml up -d --build
 docker compose -f docker-compose.manual-failover.yml ps
 docker logs --tail=100 aiomanager-manual-failover
+```
+
+To update this test instance later without changing production:
+
+```bash
+cd /opt/aiomanager-manual-failover
+git pull --ff-only
+docker compose -f docker-compose.manual-failover.yml up -d --build
 ```
 
 ## Pangolin resource
