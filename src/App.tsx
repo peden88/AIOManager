@@ -12,6 +12,7 @@ import { useAuthStore } from '@/store/authStore'
 import { useUIStore } from '@/store/uiStore'
 import { useProfileStore } from '@/store/profileStore'
 import { useFailoverStore } from '@/store/failoverStore'
+import { useManualFailoverStore } from '@/store/manualFailoverStore'
 import { useSyncStore } from '@/store/syncStore'
 import { LoginPage } from '@/pages/LoginPage'
 import { KeybindingsHelp } from '@/components/KeybindingsHelp'
@@ -32,6 +33,7 @@ function App() {
   const initializeUI = useUIStore((state) => state.initialize)
   const initializeProfiles = useProfileStore((state) => state.initialize)
   const initializeFailover = useFailoverStore((state) => state.initialize)
+  const initializeManualFailover = useManualFailoverStore((state) => state.initialize)
   const startFailoverAutomation = useFailoverStore((state) => state.startAutomation)
   const isLocked = useAuthStore((state) => state.isLocked)
   const [isInitialized, setIsInitialized] = useState(false)
@@ -48,7 +50,8 @@ function App() {
       await Promise.all([
         initializeAddons(),
         initializeProfiles(),
-        initializeFailover()
+        initializeFailover(),
+        initializeManualFailover()
       ])
 
       startFailoverAutomation()
@@ -56,7 +59,7 @@ function App() {
     }
 
     init()
-  }, [initializeAccounts, initializeAddons, initializeAuth, initializeUI, initializeProfiles, initializeFailover, startFailoverAutomation])
+  }, [initializeAccounts, initializeAddons, initializeAuth, initializeUI, initializeProfiles, initializeFailover, initializeManualFailover, startFailoverAutomation])
 
   // Trigger sync when app unlocks to ensure parity
   useEffect(() => {
