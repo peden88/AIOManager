@@ -3,7 +3,7 @@ import { motion } from 'framer-motion'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useSyncStore } from '@/store/syncStore'
 import { useFailoverStore } from '@/store/failoverStore'
-import { LogOut, LayoutDashboard, Package, Activity, BarChart3, Settings, HelpCircle, Zap, ZapOff, ShieldCheck, ExternalLink } from 'lucide-react'
+import { LogOut, LayoutDashboard, Package, Activity, BarChart3, Settings, HelpCircle, Zap, ZapOff, ShieldCheck, ExternalLink, ArrowLeftRight } from 'lucide-react'
 import { SyncStatus } from '@/components/SyncStatus'
 import { useVaultStore } from '@/store/vaultStore'
 import { useProviderStore } from '@/store/providerStore'
@@ -264,6 +264,16 @@ export function Header() {
             <Package className="h-3.5 w-3.5" />
             <span className="text-[13px]">Addons</span>
           </Link>
+          <Link
+            to="/manual-failover"
+            className={`pb-2 px-3 border-b-2 transition-colors duration-150 shrink-0 flex items-center gap-2 ${location.pathname === '/manual-failover'
+              ? 'border-primary text-foreground font-semibold [filter:drop-shadow(0_2px_6px_hsl(var(--primary)/0.4))]'
+              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-primary/30'
+              }`}
+          >
+            <ArrowLeftRight className="h-3.5 w-3.5" />
+            <span className="text-[13px]">Failover</span>
+          </Link>
 
           <Link
             to="/activity"
@@ -328,6 +338,7 @@ export function Header() {
         {[
           { to: '/', icon: LayoutDashboard, label: 'Accounts' },
           { to: '/saved-addons', icon: Package, label: 'Addons' },
+          { to: '/manual-failover', icon: ArrowLeftRight, label: 'Failover' },
           { to: '/activity', icon: Activity, label: 'Activity' },
           { to: '/metrics', icon: BarChart3, label: 'Metrics' },
           { to: '/replay', icon: null, label: 'Replay' },

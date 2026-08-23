@@ -101,6 +101,11 @@ interface AccountStore {
             addonUrls: string[],
             isEnabled: boolean
       ) => Promise<void>
+      swapAddonEnabledState: (
+            accountId: string,
+            disableUrl: string,
+            enableUrl: string
+      ) => Promise<void>
       updateAddonSettings: (
             accountId: string,
             transportUrl: string,
@@ -1212,6 +1217,57 @@ export const useAccountStore = create<AccountStore>((set, get) => ({
             addonUrls.forEach(url => {
                   autopilotManager.handleManualToggle(accountId, url)
             })
+      },
+
+      swapAddonEnabledState: async (accountId: string, disableUrl: string, enableUrl: string) => {
+            const account = get().accounts.find((acc) => acc.id === accountId)
+            if (!account) throw new Error('Account not found')
+
+            const disabledTarget = normalizeAddonUrl(disableUrl).toLowerCase()
+            const enabledTarget = normalizeAddonUrl(enableUrl).toLowerCase()
+            const hasDisabledTarget = account.addons.some(
+                  addon => normalizeAddonUrl(addon.transportUrl).toLowerCase() === disabledTarget
+            )
+            const hasEnabledTarget = account.addons.some(
+                  addon => normalizeAddonUrl(addon.transportUrl).toLowerCase() === enabledTarget
+            )
+
+            if (!hasDisabledTarget || !hasEnabledTarget) {
+                  throw new Error('Both primary and backup addons must be installed on the account')
+            }
+
+            const updatedAddons = account.addons.map((addon) => {
+                  const normalizedUrl = normalizeAddonUrl(addon.transportUrl).toLowerCase()
+                  if (normalizedUrl === disabledTarget) {
+                        return {
+                              ...addon,
+                              flags: { ...addon.flags, enabled: false },
+                              metadata: { ...addon.metadata, lastUpdated: Date.now() }
+                        }
+                  }
+                  if (normalizedUrl === enabledTarget) {
+                        return {
+                              ...addon,
+                              flags: { ...addon.flags, enabled: true },
+                              metadata: { ...addon.metadata, lastUpdated: Date.now() }
+                        }
+                  }
+                  return addon
+            })
+
+            const authKey = await decrypt(account.authKey, getEncryptionKey())
+            await updateAddons(authKey, updatedAddons, accountId)
+
+            const accounts = get().accounts.map((acc) =>
+                  acc.id === accountId ? { ...acc, addons: updatedAddons } : acc
+            )
+            set({ accounts })
+            await localforage.setItem(STORAGE_KEY, accounts)
+
+            const { useSyncStore } = await import('./syncStore')
+            useSyncStore.getState().syncToRemote(true).catch(console.error)
+            autopilotManager.handleManualToggle(accountId, disableUrl)
+            autopilotManager.handleManualToggle(accountId, enableUrl)
       },
 
       reinstallAddon: async (accountId: string, transportUrl: string) => {

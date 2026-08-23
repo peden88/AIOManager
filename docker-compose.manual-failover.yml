@@ -1,0 +1,26 @@
+services:
+  aiomanager-manual-failover:
+    build:
+      context: .
+    image: aiomanager:manual-failover-test
+    container_name: aiomanager-manual-failover
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1611:1610"
+    env_file:
+      - .env.manual-failover
+    volumes:
+      - ./aio-data-manual-failover:/app/data
+    networks:
+      - default
+      - pangolin_frontend
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "server/healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+networks:
+  pangolin_frontend:
+    external: true
