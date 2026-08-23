@@ -34,6 +34,8 @@ function App() {
   const initializeProfiles = useProfileStore((state) => state.initialize)
   const initializeFailover = useFailoverStore((state) => state.initialize)
   const initializeManualFailover = useManualFailoverStore((state) => state.initialize)
+  const syncManualFailoverExecution = useManualFailoverStore((state) => state.syncExecutionState)
+  const pullManualFailoverExecutionState = useManualFailoverStore((state) => state.pullExecutionState)
   const startFailoverAutomation = useFailoverStore((state) => state.startAutomation)
   const isLocked = useAuthStore((state) => state.isLocked)
   const [isInitialized, setIsInitialized] = useState(false)
@@ -66,12 +68,35 @@ function App() {
     if (!isLocked && auth.isAuthenticated && isInitialized) {
       console.log('[App] Vault unlocked. Triggering fresh cloud pull.')
       // 1. Sync Cloud -> App (Pull latest changes)
-      useSyncStore.getState().refreshFromCloud().then(() => {
+      useSyncStore.getState().refreshFromCloud().then(async () => {
         // 2. Sync Stremio -> App (Once local state is updated from cloud)
-        useAccountStore.getState().syncAllAccounts()
+        await useAccountStore.getState().syncAllAccounts()
+        // 3. Refresh the encrypted server-side execution copy used by external API callers
+        await syncManualFailoverExecution()
       }).catch(console.error)
     }
-  }, [isLocked, auth.isAuthenticated, isInitialized])
+  }, [isLocked, auth.isAuthenticated, isInitialized, syncManualFailoverExecution])
+
+  // Keep an open dashboard in step with Apple Shortcut / bot initiated actions.
+  useEffect(() => {
+    if (isLocked || !auth.isAuthenticated || !isInitialized) return
+
+    const pullState = () => pullManualFailoverExecutionState().catch(error =>
+      console.warn('[Manual Failover] State refresh failed:', error)
+    )
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') pullState()
+    }
+
+    const interval = window.setInterval(pullState, 30000)
+    window.addEventListener('focus', pullState)
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', pullState)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [isLocked, auth.isAuthenticated, isInitialized, pullManualFailoverExecutionState])
 
   // Sync UUID to URL for easy bookmarking/sharing
   useEffect(() => {
