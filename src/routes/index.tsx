@@ -3,6 +3,7 @@ import { AccountsPage } from '@/pages/AccountsPage'
 import { AccountDetailPage } from '@/pages/AccountDetailPage'
 import { SavedAddonsPage } from '@/pages/SavedAddonsPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
+import { ManualFailoverPage } from '@/pages/ManualFailoverPage'
 
 import { FAQPage } from '@/pages/FAQPage'
 import { SettingsPage } from '@/pages/SettingsPage'
@@ -19,6 +20,7 @@ export function AppRoutes() {
     <Routes>
       <Route path="/" element={<AccountsPage />} />
       <Route path="/saved-addons" element={<SavedAddonsPage />} />
+      <Route path="/manual-failover" element={<ManualFailoverPage />} />
 
       <Route path="/activity" element={
         <ErrorBoundary>
@@ -54,4 +56,3 @@ export function AppRoutes() {
     </Routes>
   )
 }
-
