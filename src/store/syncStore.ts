@@ -6,6 +6,7 @@ import { useAccountStore } from './accountStore'
 import { useAddonStore } from './addonStore'
 import { useProfileStore } from './profileStore'
 import { useFailoverStore } from './failoverStore'
+import { useManualFailoverStore } from './manualFailoverStore'
 import { useAuthStore } from './authStore'
 import { useVaultStore } from './vaultStore'
 import { toast } from '@/hooks/use-toast'
@@ -280,6 +281,7 @@ export const useSyncStore = create<SyncState>()(
                             addons: data?.addons || { version: '1.0', savedAddons: [] },
                             profiles: Array.isArray(data?.profiles) ? data.profiles : [],
                             failover: data?.failover || [],
+                            manualFailoverGroups: Array.isArray(data?.manualFailoverGroups) ? data.manualFailoverGroups : [],
                             vault: data?.vault || [],
                             salt: data?.salt,
                             name: data?.name,
@@ -398,6 +400,9 @@ export const useSyncStore = create<SyncState>()(
                                 await useFailoverStore.getState().importWebhook(data.failover.webhook, true)
                             }
                         }
+                    }
+                    if (data.manualFailoverGroups && !isLocalNewer) {
+                        await useManualFailoverStore.getState().importGroups(data.manualFailoverGroups)
                     }
 
                     if (data.vault) {
@@ -523,6 +528,7 @@ export const useSyncStore = create<SyncState>()(
                             rules: useFailoverStore.getState().rules,
                             webhook: useFailoverStore.getState().webhook
                         },
+                        manualFailoverGroups: useManualFailoverStore.getState().groups,
                         vault: useVaultStore.getState().keys,
                         salt: saltBase64,
                         name: auth.name,
@@ -660,6 +666,9 @@ export const useSyncStore = create<SyncState>()(
                             if (data.failover.rules) await useFailoverStore.getState().importRules(data.failover.rules, strategy, true)
                             if (data.failover.webhook) await useFailoverStore.getState().importWebhook(data.failover.webhook, true)
                         }
+                    }
+                    if (Array.isArray(data.manualFailoverGroups)) {
+                        await useManualFailoverStore.getState().importGroups(data.manualFailoverGroups)
                     }
 
                     set({ lastSyncedAt: data.syncedAt || new Date().toISOString() })
