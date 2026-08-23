@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import localforage from 'localforage'
 import { v4 as uuidv4 } from 'uuid'
+import type { ManualFailoverServerState } from '@/api/manual-failover'
 
 const STORAGE_KEY = 'stremio-manager:manual-failover-groups'
 
@@ -17,6 +18,7 @@ export interface ManualFailoverGroup {
   backupName?: string
   homeButtonSlot?: 1 | 2
   activeMode: ManualFailoverMode
+  modeUpdatedAt?: string
   updatedAt: string
 }
 
@@ -36,6 +38,8 @@ interface ManualFailoverStore {
   setMode: (id: string, activeMode: ManualFailoverMode) => Promise<void>
   runGroup: (id: string, target: ManualFailoverMode) => Promise<ManualFailoverExecutionResult>
   assignHomeButton: (slot: 1 | 2, groupId: string | null) => Promise<void>
+  syncExecutionState: () => Promise<void>
+  pullExecutionState: () => Promise<void>
   importGroups: (groups: ManualFailoverGroup[]) => Promise<void>
 }
 
@@ -43,6 +47,29 @@ async function persist(groups: ManualFailoverGroup[]) {
   await localforage.setItem(STORAGE_KEY, groups)
   const { useSyncStore } = await import('./syncStore')
   useSyncStore.getState().syncToRemote(true).catch(console.error)
+}
+
+async function applyServerStates(
+  groups: ManualFailoverGroup[],
+  states: ManualFailoverServerState[],
+) {
+  const stateMap = new Map(states.map(state => [state.id, state]))
+  let changed = false
+  const reconciled = groups.map(group => {
+    const serverState = stateMap.get(group.id)
+    if (!serverState) return group
+    const localTimestamp = Date.parse(group.modeUpdatedAt || group.updatedAt || '') || 0
+    if (serverState.updatedAt < localTimestamp) return group
+    const serverTimestamp = new Date(serverState.updatedAt).toISOString()
+    if (group.activeMode === serverState.activeMode && group.modeUpdatedAt === serverTimestamp) return group
+    changed = true
+    return { ...group, activeMode: serverState.activeMode, modeUpdatedAt: serverTimestamp }
+  })
+
+  if (changed) {
+    await localforage.setItem(STORAGE_KEY, reconciled)
+  }
+  return { groups: reconciled, changed }
 }
 
 export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => ({
@@ -60,6 +87,7 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
       id: input.id || uuidv4(),
       homeButtonSlot: input.homeButtonSlot ?? existing?.homeButtonSlot,
       activeMode: existing?.activeMode || 'primary',
+      modeUpdatedAt: input.modeUpdatedAt || existing?.modeUpdatedAt || existing?.updatedAt || now,
       updatedAt: now,
     }
     const groups = existing
@@ -67,18 +95,22 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
       : [...get().groups, group]
     set({ groups })
     await persist(groups)
+    get().syncExecutionState().catch(error => console.warn('[Manual Failover] API sync failed:', error))
   },
   removeGroup: async (id) => {
     const groups = get().groups.filter(group => group.id !== id)
     set({ groups })
     await persist(groups)
+    get().syncExecutionState().catch(error => console.warn('[Manual Failover] API sync failed:', error))
   },
   setMode: async (id, activeMode) => {
+    const now = new Date().toISOString()
     const groups = get().groups.map(group =>
-      group.id === id ? { ...group, activeMode, updatedAt: new Date().toISOString() } : group
+      group.id === id ? { ...group, activeMode, modeUpdatedAt: now, updatedAt: now } : group
     )
     set({ groups })
     await persist(groups)
+    get().syncExecutionState().catch(error => console.warn('[Manual Failover] API sync failed:', error))
   },
   runGroup: async (id, target) => {
     const group = get().groups.find(item => item.id === id)
@@ -98,11 +130,13 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
     const succeeded = results.length - failures.length
 
     if (succeeded > 0) {
+      const now = new Date().toISOString()
       const groups = get().groups.map(item =>
-        item.id === id ? { ...item, activeMode: target, updatedAt: new Date().toISOString() } : item
+        item.id === id ? { ...item, activeMode: target, modeUpdatedAt: now, updatedAt: now } : item
       )
       set({ groups })
       await persist(groups)
+      get().syncExecutionState().catch(error => console.warn('[Manual Failover] API sync failed:', error))
     }
 
     return { target, succeeded, failed: failures.length, failures }
@@ -125,6 +159,29 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
     })
     set({ groups })
     await persist(groups)
+    get().syncExecutionState().catch(error => console.warn('[Manual Failover] API sync failed:', error))
+  },
+  syncExecutionState: async () => {
+    const { syncManualFailoverExecution } = await import('@/api/manual-failover')
+    const states = await syncManualFailoverExecution(get().groups)
+    if (!states) return
+    const reconciled = await applyServerStates(get().groups, states)
+    if (reconciled.changed) {
+      set({ groups: reconciled.groups })
+      const { useSyncStore } = await import('./syncStore')
+      useSyncStore.getState().syncToRemote(true).catch(console.error)
+    }
+  },
+  pullExecutionState: async () => {
+    const { pullManualFailoverExecutionStates } = await import('@/api/manual-failover')
+    const states = await pullManualFailoverExecutionStates()
+    if (!states) return
+    const reconciled = await applyServerStates(get().groups, states)
+    if (reconciled.changed) {
+      set({ groups: reconciled.groups })
+      const { useSyncStore } = await import('./syncStore')
+      useSyncStore.getState().syncToRemote(true).catch(console.error)
+    }
   },
   importGroups: async (groups) => {
     const safeGroups = Array.isArray(groups) ? groups : []
