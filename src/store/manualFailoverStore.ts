@@ -13,8 +13,18 @@ export interface ManualFailoverGroup {
   accountIds: string[]
   primaryUrl: string
   backupUrl: string
+  primaryName?: string
+  backupName?: string
+  homeButtonSlot?: 1 | 2
   activeMode: ManualFailoverMode
   updatedAt: string
+}
+
+export interface ManualFailoverExecutionResult {
+  target: ManualFailoverMode
+  succeeded: number
+  failed: number
+  failures: Array<{ accountId: string; reason: string }>
 }
 
 interface ManualFailoverStore {
@@ -24,6 +34,8 @@ interface ManualFailoverStore {
   saveGroup: (group: Omit<ManualFailoverGroup, 'id' | 'activeMode' | 'updatedAt'> & { id?: string }) => Promise<void>
   removeGroup: (id: string) => Promise<void>
   setMode: (id: string, activeMode: ManualFailoverMode) => Promise<void>
+  runGroup: (id: string, target: ManualFailoverMode) => Promise<ManualFailoverExecutionResult>
+  assignHomeButton: (slot: 1 | 2, groupId: string | null) => Promise<void>
   importGroups: (groups: ManualFailoverGroup[]) => Promise<void>
 }
 
@@ -46,6 +58,7 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
     const group: ManualFailoverGroup = {
       ...input,
       id: input.id || uuidv4(),
+      homeButtonSlot: input.homeButtonSlot ?? existing?.homeButtonSlot,
       activeMode: existing?.activeMode || 'primary',
       updatedAt: now,
     }
@@ -64,6 +77,52 @@ export const useManualFailoverStore = create<ManualFailoverStore>((set, get) => 
     const groups = get().groups.map(group =>
       group.id === id ? { ...group, activeMode, updatedAt: new Date().toISOString() } : group
     )
+    set({ groups })
+    await persist(groups)
+  },
+  runGroup: async (id, target) => {
+    const group = get().groups.find(item => item.id === id)
+    if (!group) throw new Error('Failover group not found')
+
+    const disableUrl = target === 'backup' ? group.primaryUrl : group.backupUrl
+    const enableUrl = target === 'backup' ? group.backupUrl : group.primaryUrl
+    const { useAccountStore } = await import('./accountStore')
+    const swapAddonEnabledState = useAccountStore.getState().swapAddonEnabledState
+    const results = await Promise.allSettled(
+      group.accountIds.map(accountId => swapAddonEnabledState(accountId, disableUrl, enableUrl))
+    )
+    const failures = results.flatMap((result, index) => result.status === 'rejected' ? [{
+      accountId: group.accountIds[index],
+      reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
+    }] : [])
+    const succeeded = results.length - failures.length
+
+    if (succeeded > 0) {
+      const groups = get().groups.map(item =>
+        item.id === id ? { ...item, activeMode: target, updatedAt: new Date().toISOString() } : item
+      )
+      set({ groups })
+      await persist(groups)
+    }
+
+    return { target, succeeded, failed: failures.length, failures }
+  },
+  assignHomeButton: async (slot, groupId) => {
+    if (groupId && !get().groups.some(group => group.id === groupId)) {
+      throw new Error('Failover group not found')
+    }
+
+    const now = new Date().toISOString()
+    const groups = get().groups.map(group => {
+      const shouldAssign = group.id === groupId
+      const shouldClear = group.homeButtonSlot === slot || (shouldAssign && group.homeButtonSlot !== slot)
+      if (!shouldAssign && !shouldClear) return group
+      return {
+        ...group,
+        homeButtonSlot: shouldAssign ? slot : undefined,
+        updatedAt: now,
+      }
+    })
     set({ groups })
     await persist(groups)
   },
