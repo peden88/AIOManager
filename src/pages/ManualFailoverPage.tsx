@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useToast } from '@/hooks/use-toast'
+import type { AddonDescriptor } from '@/types/addon'
 
 type Draft = {
   id?: string
@@ -21,6 +22,14 @@ type Draft = {
 }
 
 const emptyDraft: Draft = { name: '', tag: '', accountIds: [], primaryUrl: '', backupUrl: '' }
+
+function getAddonDisplayName(addon: AddonDescriptor | undefined, fallback = 'Unknown addon') {
+  const customName = addon?.metadata?.customName?.trim()
+  const manifestName = addon?.manifest?.name?.trim()
+  const transportName = addon?.transportName?.trim()
+
+  return customName || manifestName || transportName || addon?.transportUrl?.trim() || fallback
+}
 
 export function ManualFailoverPage() {
   const accounts = useAccountStore(state => state.accounts)
@@ -35,10 +44,11 @@ export function ManualFailoverPage() {
     const selected = accounts.filter(account => draft.accountIds.includes(account.id))
     const source = selected.length ? selected : accounts
     const urls = new Map<string, string>()
-    source.flatMap(account => account.addons).forEach(addon => {
-      if (!urls.has(addon.transportUrl)) urls.set(addon.transportUrl, addon.metadata?.customName || addon.manifest.name)
+    source.flatMap(account => Array.isArray(account.addons) ? account.addons : []).forEach(addon => {
+      const url = addon?.transportUrl?.trim()
+      if (url && !urls.has(url)) urls.set(url, getAddonDisplayName(addon))
     })
-    return [...urls.entries()].sort((a, b) => a[1].localeCompare(b[1]))
+    return [...urls.entries()].sort((a, b) => a[1].localeCompare(b[1], undefined, { sensitivity: 'base' }))
   }, [accounts, draft.accountIds])
 
   const openEditor = (group?: ManualFailoverGroup) => {
@@ -99,8 +109,9 @@ export function ManualFailoverPage() {
         <div className="grid gap-4 lg:grid-cols-2">
           {groups.map(group => {
             const members = accounts.filter(account => group.accountIds.includes(account.id))
-            const primaryName = members.flatMap(a => a.addons).find(a => a.transportUrl === group.primaryUrl)?.manifest.name || 'Primary addon'
-            const backupName = members.flatMap(a => a.addons).find(a => a.transportUrl === group.backupUrl)?.manifest.name || 'Backup addon'
+            const memberAddons = members.flatMap(account => Array.isArray(account.addons) ? account.addons : [])
+            const primaryName = getAddonDisplayName(memberAddons.find(addon => addon?.transportUrl === group.primaryUrl), 'Primary addon')
+            const backupName = getAddonDisplayName(memberAddons.find(addon => addon?.transportUrl === group.backupUrl), 'Backup addon')
             const isRunning = runningId === group.id
             return (
               <Card key={group.id} className={group.activeMode === 'backup' ? 'border-amber-500/40' : ''}>
