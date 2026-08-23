@@ -38,6 +38,7 @@ import {
   rectSortingStrategy,
 } from '@dnd-kit/sortable'
 import { SortableAccountCard } from './SortableAccountCard'
+import { ManualFailoverQuickActions } from './ManualFailoverQuickActions'
 
 export function AccountList() {
   const openAddAccountDialog = useUIStore((state) => state.openAddAccountDialog)
@@ -251,6 +252,8 @@ export function AccountList() {
 
   return (
     <div className="space-y-4">
+      <ManualFailoverQuickActions />
+
       {error && (
         <div className="bg-destructive/10 border border-destructive text-destructive px-4 py-3 rounded-md flex items-center justify-between">
           <span>{error}</span>
