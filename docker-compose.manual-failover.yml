@@ -1,6 +1,8 @@
 services:
   aiomanager-manual-failover:
-    image: ghcr.io/peden88/aiomanager:manual-failover
+    build:
+      context: .
+    image: aiomanager:manual-failover-test
     container_name: aiomanager-manual-failover
     restart: unless-stopped
     ports:
